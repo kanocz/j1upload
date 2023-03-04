@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path"
 	"strings"
 	"time"
 )
@@ -67,14 +68,22 @@ func main() {
 	}
 	filename := args[0]
 
+	uploadFilename := filename
+	if envFilename := os.Getenv("SLIC3R_PP_OUTPUT_NAME"); envFilename != "" {
+		uploadFilename = envFilename
+	}
+	uploadFilename = path.Base(uploadFilename)
+
+	log.Println("Using filename: ", uploadFilename)
+
 	addr := getPrinter()
 	if addr == nil {
-		return
+		os.Exit(-1)
 	}
 
 	conn := SACP_connect(addr.IP.String(), time.Second*5)
 	if conn == nil {
-		return
+		os.Exit(-2)
 	}
 	defer conn.Close()
 
@@ -83,7 +92,7 @@ func main() {
 		log.Fatalln("Error reading \""+filename+"\": ", err)
 	}
 
-	err = SACP_start_upload(conn, filename, data, time.Second*10)
+	err = SACP_start_upload(conn, uploadFilename, data, time.Second*10)
 	if err != nil {
 		log.Fatalln("Error writing \"job\": ", err)
 	}
