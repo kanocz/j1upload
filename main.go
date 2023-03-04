@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -12,11 +14,11 @@ var (
 	discoverTimeout = flag.Duration("discover.timeout", time.Second*5, "printer discovery timeout")
 )
 
-func getPrinter() (string, *net.UDPAddr) {
+func getPrinter() *net.UDPAddr {
 	conn, err := net.ListenUDP("udp4", nil)
 	if err != nil {
-		fmt.Println("unable to listen UDP:", err)
-		return "", nil
+		log.Println("unable to listen UDP:", err)
+		return nil
 	}
 	defer conn.Close()
 
@@ -25,31 +27,73 @@ func getPrinter() (string, *net.UDPAddr) {
 	broadcast := &net.UDPAddr{IP: []byte{255, 255, 255, 255}, Port: 20054}
 	_, err = conn.WriteToUDP([]byte("discover"), broadcast)
 	if err != nil {
-		fmt.Println("unable to send UDP broadcast:", err)
-		return "", nil
-	}
-
-	buf := make([]byte, 1500) // 1500 is default MTU on most systems
-	l, addr, err := conn.ReadFromUDP(buf)
-	if err != nil || l < 2 {
-		fmt.Println("unable discover printer:", err)
-		return "", nil
-	}
-
-	return string(buf[:l]), addr
-}
-
-func SACP_connect(ip string) net.Conn {
-	conn, err := net.Dial("tcp4", ip+":8888")
-	if err != nil {
-		log.Printf("Error connecting to %s: %v", ip, err)
+		log.Println("unable to send UDP broadcast:", err)
 		return nil
 	}
 
-	return conn
+	buf := make([]byte, 1500) // 1500 is default MTU on most systems
+	for {
+
+		l, addr, err := conn.ReadFromUDP(buf)
+		if err != nil || l < 2 {
+			log.Println("unable discover printer:", err)
+			return nil
+		}
+
+		parts := strings.Split(string(buf[:l]), "|")
+		if len(parts) != 3 {
+			log.Println("Unknown printer responce: ", string(buf[:l]))
+			continue
+		}
+
+		if parts[1] != "model:Snapmaker J1" || parts[2] != "SACP:1" {
+			log.Println("Not J1 printer found: ", string(buf[:l]), " at ", addr.IP)
+			continue
+		}
+
+		log.Println("Printer found: ", parts[0])
+		return addr
+	}
 }
 
 func main() {
-	msg, addr := getPrinter()
-	fmt.Println("Found ", msg, " on ", addr.IP)
+
+	flag.Parse()
+	args := flag.Args()
+	if len(args) != 1 {
+		fmt.Fprint(os.Stderr, "Use with gcode filename\n\n")
+		flag.Usage()
+		return
+	}
+	filename := args[0]
+
+	addr := getPrinter()
+	if addr == nil {
+		return
+	}
+
+	conn := SACP_connect(addr.IP.String(), time.Second*5)
+	if conn == nil {
+		return
+	}
+	defer conn.Close()
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		log.Fatalln("Error reading \""+filename+"\": ", err)
+	}
+
+	err = SACP_start_upload(conn, filename, data)
+	if err != nil {
+		log.Fatalln("Error writing \"job\": ", err)
+	}
+
+	p, err := SACP_read(conn, time.Second*10)
+	if err != nil {
+		log.Println("Error reading \"job start\" responce: ", err)
+		return
+	}
+
+	log.Printf("Got reply from printer on hello: %v", p)
+
 }
