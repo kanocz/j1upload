@@ -83,17 +83,9 @@ func main() {
 		log.Fatalln("Error reading \""+filename+"\": ", err)
 	}
 
-	err = SACP_start_upload(conn, filename, data)
+	err = SACP_start_upload(conn, filename, data, time.Second*10)
 	if err != nil {
 		log.Fatalln("Error writing \"job\": ", err)
 	}
-
-	p, err := SACP_read(conn, time.Second*10)
-	if err != nil {
-		log.Println("Error reading \"job start\" responce: ", err)
-		return
-	}
-
-	log.Printf("Got reply from printer on hello: %v", p)
 
 }

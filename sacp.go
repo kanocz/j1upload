@@ -135,6 +135,11 @@ func writeSACPstring(w io.Writer, s string) {
 	w.Write([]byte(s))
 }
 
+func writeSACPbytes(w io.Writer, s []byte) {
+	binary.Write(w, binary.LittleEndian, uint16(len(s)))
+	w.Write(s)
+}
+
 func writeLE[T any](w io.Writer, u T) {
 	binary.Write(w, binary.LittleEndian, u)
 }
@@ -168,13 +173,19 @@ func SACP_connect(ip string, timeout time.Duration) net.Conn {
 	}
 
 	p, err := SACP_read(conn, timeout)
-	if err != nil {
+	if err != nil || p == nil {
 		log.Println("Error reading \"hello\" responce: ", err)
 		conn.Close()
 		return nil
 	}
 
-	log.Printf("Got reply from printer on hello: %v", p)
+	if !(p.CommandSet == 1 && p.CommandID == 5) {
+		log.Printf("Got command set/id %d/%d but expected 1/5", p.CommandSet, p.CommandID)
+		conn.Close()
+		return nil
+	}
+
+	log.Println("Connected to printer")
 
 	return conn
 }
@@ -203,17 +214,23 @@ func SACP_read(conn net.Conn, timeout time.Duration) (*SACP_pack, error) {
 	return &sacp, err
 }
 
-func SACP_start_upload(conn net.Conn, filename string, gcode []byte) error {
-	package_count := (len(gcode) / SACP_data_len) + 1
+func SACP_start_upload(conn net.Conn, filename string, gcode []byte, timeout time.Duration) error {
+
+	// prepare data for upload begin packet
+
+	package_count := uint16((len(gcode) / SACP_data_len) + 1)
 	md5hash := md5.Sum(gcode)
 
 	data := bytes.Buffer{}
 
 	writeSACPstring(&data, filename)
 	writeLE(&data, uint32(len(gcode)))
-	writeLE(&data, uint16(package_count))
+	writeLE(&data, package_count)
 	writeSACPstring(&data, hex.EncodeToString(md5hash[:]))
 
+	log.Println("Starting upload...")
+
+	conn.SetWriteDeadline(time.Now().Add(timeout))
 	_, err := conn.Write(SACP_pack{
 		ReceiverID: 2,
 		SenderID:   0,
@@ -224,5 +241,99 @@ func SACP_start_upload(conn net.Conn, filename string, gcode []byte) error {
 		Data:       data.Bytes(),
 	}.Encode())
 
-	return err
+	if err != nil {
+		return err
+	}
+
+	for {
+		// always receive packet, then send responce
+		conn.SetReadDeadline(time.Now().Add(timeout))
+		p, err := SACP_read(conn, time.Second*10)
+		if err != nil {
+			return err
+		}
+
+		if p == nil {
+			return errInvalidSize
+		}
+
+		// log.Printf("DEBUG: Got reply from printer: %v", p)
+
+		switch {
+		case p.CommandSet == 0xb0 && p.CommandID == 0:
+			// just ignore, don't know that this message means :)
+		case p.CommandSet == 0xb0 && p.CommandID == 1:
+			// sending next chunk
+			if len(p.Data) < 4 {
+				return errInvalidSize
+			}
+			md5_len := binary.LittleEndian.Uint16(p.Data[:2])
+			if len(p.Data) < 2+int(md5_len)+2 {
+				return errInvalidSize
+			}
+
+			pkgRequested := binary.LittleEndian.Uint16(p.Data[2+md5_len : 2+md5_len+2])
+			var pkgData []byte
+
+			if pkgRequested == package_count-1 { // last package
+				pkgData = gcode[SACP_data_len*int(pkgRequested):]
+			} else { // regular package
+				pkgData = gcode[SACP_data_len*int(pkgRequested) : SACP_data_len*int(pkgRequested+1)]
+			}
+
+			data := bytes.Buffer{}
+			data.WriteByte(0)
+			writeSACPstring(&data, hex.EncodeToString(md5hash[:]))
+			writeLE(&data, pkgRequested)
+			writeSACPbytes(&data, pkgData)
+
+			log.Printf("  sending package %d of %d", pkgRequested+1, package_count)
+
+			conn.SetWriteDeadline(time.Now().Add(timeout))
+			_, err := conn.Write(SACP_pack{
+				ReceiverID: 2,
+				SenderID:   0,
+				Attribute:  1,
+				Sequence:   p.Sequence,
+				CommandSet: 0xb0,
+				CommandID:  0x01,
+				Data:       data.Bytes(),
+			}.Encode())
+
+			if err != nil {
+				return err
+			}
+
+		case p.CommandSet == 0xb0 && p.CommandID == 2:
+			// send finished!!!
+			if len(p.Data) == 1 && p.Data[0] == 0 {
+
+				log.Print("Upload finished")
+
+				conn.SetWriteDeadline(time.Now().Add(timeout))
+				_, err := conn.Write(SACP_pack{
+					ReceiverID: 2,
+					SenderID:   0,
+					Attribute:  0,
+					Sequence:   1,
+					CommandSet: 0x01,
+					CommandID:  0x06,
+					Data:       []byte{},
+				}.Encode())
+
+				if err != nil {
+					return err
+				}
+
+				return nil // everything is ok!
+			}
+
+			log.Print("Unable to process b0/02 with invalid data", p.Data)
+
+			// if no... I don't know what to do :)
+		default:
+			log.Printf("Unknown command %d/%d", p.CommandSet, p.CommandID)
+		}
+
+	}
 }
